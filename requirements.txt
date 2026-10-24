@@ -1,2 +1,2 @@
 homeassistant
-bluetti-bt-lib @ git+https://github.com/defire04/bluetti-bt-lib.git@feature-encrypted-device-write-support
+bluetti-bt-lib @ git+https://github.com/spencer012/bluetti-bt-lib.git@encrypted-writes-nostdlib
