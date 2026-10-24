@@ -8,71 +8,14 @@ from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from bluetti_bt_lib import build_device, DeviceReader, DeviceReaderConfig
-from bluetti_bt_lib.bluetooth.encryption import Message, MessageType
-from bluetti_bt_lib.const import WRITE_UUID
 
 from .utils import mac_loggable
 from .types import FullDeviceConfig
 
-
-class SafeDeviceReader(DeviceReader):
-    """Device reader that ignores malformed encrypted notifications."""
-
-    async def _notification_handler(self, _: int, data: bytearray):
-        """Handle bt data."""
-        self.logger.debug("Got new data")
-
-        if self.config.use_encryption is True:
-            message = Message(data)
-
-            if message.is_pre_key_exchange:
-                message.verify_checksum()
-
-                if message.type == MessageType.CHALLENGE:
-                    challenge_response = self.encryption.msg_challenge(message)
-                    await self.client.write_gatt_char(WRITE_UUID, challenge_response)
-                    return
-
-                if message.type == MessageType.CHALLENGE_ACCEPTED:
-                    self.logger.debug("Challenge accepted")
-                    return
-
-            if self.encryption.unsecure_aes_key is None:
-                self.logger.warning(
-                    "Received encrypted message before key initialization"
-                )
-                return
-
-            key, iv = self.encryption.getKeyIv()
-            try:
-                decrypted = Message(self.encryption.aes_decrypt(message.buffer, key, iv))
-            except ValueError as err:
-                self.logger.debug("Ignoring invalid encrypted notification: %s", err)
-                return
-
-            if decrypted.is_pre_key_exchange:
-                decrypted.verify_checksum()
-
-                if decrypted.type == MessageType.PEER_PUBKEY:
-                    peer_pubkey_response = self.encryption.msg_peer_pubkey(decrypted)
-                    await self.client.write_gatt_char(WRITE_UUID, peer_pubkey_response)
-                    return
-
-                if decrypted.type == MessageType.PUBKEY_ACCEPTED:
-                    self.encryption.msg_key_accepted(decrypted)
-                    return
-
-            data = decrypted.buffer
-
-        self.notify_response.extend(data)
-
-        if self.notify_future is None:
-            return
-
-        if self.notify_future.done():
-            return
-
-        self.notify_future.set_result(self.notify_response)
+# Entities go unavailable after this many failed polls in a row (see the
+# _unavailable_counter in the entity platforms). Single failures are normal
+# over BLE, so the coordinator only reports a failure once it lasts that long.
+FAILED_POLLS_BEFORE_WARNING = 5
 
 
 class PollingCoordinator(DataUpdateCoordinator):
@@ -105,7 +48,9 @@ class PollingCoordinator(DataUpdateCoordinator):
             self.async_shutdown()
             return None
 
-        self.reader = SafeDeviceReader(
+        self._failed_polls = 0
+
+        self.reader = DeviceReader(
             config.address,
             bluetti_device,
             self.hass.loop.create_future,
@@ -130,8 +75,37 @@ class PollingCoordinator(DataUpdateCoordinator):
             )
             is False
         ):
-            self.logger.warning("Device not connected")
+            self._poll_failed("Device not in range of a connectable Bluetooth adapter")
             self.last_update_success = False
             return None
 
-        return await self.reader.read()
+        data = await self.reader.read()
+
+        if data is None:
+            self._poll_failed(getattr(self.reader, "last_error", None) or "No data")
+        else:
+            self._poll_succeeded()
+
+        return data
+
+    def _poll_failed(self, error: str):
+        self._failed_polls += 1
+        self.logger.debug("Poll %s failed: %s", self._failed_polls, error)
+
+        if self._failed_polls == FAILED_POLLS_BEFORE_WARNING:
+            self.logger.warning(
+                "%s: %s failed polls in a row, entities are unavailable until "
+                "a poll succeeds. Last error: %s",
+                self.config.name,
+                self._failed_polls,
+                error,
+            )
+
+    def _poll_succeeded(self):
+        if self._failed_polls >= FAILED_POLLS_BEFORE_WARNING:
+            self.logger.info(
+                "%s: polling recovered after %s failed polls",
+                self.config.name,
+                self._failed_polls,
+            )
+        self._failed_polls = 0
